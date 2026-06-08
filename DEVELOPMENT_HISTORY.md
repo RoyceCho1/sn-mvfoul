@@ -454,24 +454,285 @@ Skeleton 데이터는 현재 방식으로는 유의미한 기여 어려움
 
 ---
 
-## 현재 상태 (2026-06-06)
+---
 
-| 버전 | 문제 | 해결 방법 |
-|---|---|---|
-| Zero-shot | 분류 불가 수준 | 파인튜닝 필요 확인 |
-| SV Reason v1 | mode collapse 없음, 일부 불균형 | balanced sampling 미적용 |
-| SV Reason Answer | think 무한 반복, <answer> 미도달 | answer-only masking 폐기 |
-| 2B MV | 모델 용량 부족, CJK drift | 8B로 교체 |
-| 8B MV v1 | mode collapse (95% Standing tackling) | balanced sampling + LR 절감 |
-| **SV Reason v2** (실행 중) | — | balanced + LR↓ + frame hint |
-| **MV Reason v2** (실행 중) | — | 위 모든 개선 적용 |
+## Step 12. 태스크 단순화: action_class 제거, offence_severity만 예측
 
-**누적된 개선사항**:
-1. QLoRA 4-bit NF4 + Vision Encoder 동결 → VRAM 32GB 내 학습
-2. Think + Answer 전체 loss → reasoning 종료 학습
-3. Foul-anchored frame sampling → 충돌 순간 집중
-4. Frame hint 프롬프트 → 중요 프레임 명시
-5. Balanced sampling (sqrt-inverse-frequency) → mode collapse 방지
-6. LR 1e-4 + 5 epochs → 학습 안정성
-7. repetition_penalty=1.5 → 무한 반복 방지
-8. JSONL 스트리밍 → 실시간 모니터링
+### 변경 배경
+초기 목표는 VARS와 동일하게 두 태스크를 동시에 푸는 것이었다.
+
+- Task 1: `action_class` 8분류
+- Task 2: `offence_severity` 4분류
+
+하지만 실험이 진행되면서 다음 문제가 반복적으로 나타났다.
+
+1. `action_class`가 매우 불균형함
+2. 모델이 `Standing tackling` 같은 다수 클래스로 collapse함
+3. severity 판단보다 action type 판단이 먼저 흔들리면서 전체 JSON 출력이 불안정해짐
+4. 최종 프로젝트 메시지는 "foul severity 판정" 쪽이 더 명확함
+
+따라서 이후 실험은 **offence_severity 4분류만 예측**하도록 단순화했다.
+
+```json
+{"offence_severity": "Offence + Yellow card"}
+```
+
+### 효과
+- 출력 스키마가 단순해짐
+- parser 실패 가능성이 줄어듦
+- VAR/심판 판정 관점에서 설명이 명확해짐
+- 다만 VARS의 Task1과 직접 비교는 하지 않고, Task2 중심 비교로 전환해야 함
+
+---
+
+## Step 13. Reasoning Prompt 재설계
+
+### 기존 문제
+초기 reasoning prompt는 자유 서술형에 가까웠다.
+
+```text
+Analyze the video and explain the foul type and severity...
+```
+
+Zero-shot과 일부 fine-tuned 모델에서 다음 문제가 발생했다.
+
+- `<answer>` 태그 미생성
+- `<think>` 무한 반복
+- 중국어/CJK drift
+- 긴 일반 축구 해설문 생성
+- `Offence + Red card` 과대예측
+
+### 개선된 slot-based reasoning
+모델이 길게 자유 서술하지 않고, 고정된 판단 항목을 채우도록 변경했다.
+
+```text
+contact: yes/no/unclear
+ball_play: yes/no/unclear
+force: low/medium/high/unclear
+risk: low/medium/high/unclear
+offence: yes/no
+card_threshold: no_card/yellow/red/none
+decision: one short reason
+```
+
+최종 출력은 여전히 `<answer>` 안의 JSON만 평가한다.
+
+```text
+<think>
+contact: yes
+ball_play: unclear
+force: medium
+risk: medium
+offence: yes
+card_threshold: yellow
+decision: contact with risk above normal football contact.
+</think>
+<answer>{"offence_severity": "Offence + Yellow card"}</answer>
+```
+
+### 중요한 해석
+`think`는 사람이 직접 라벨링한 정답이 아니다. annotation 속성에서 deterministic하게 합성한 supervision이다.
+따라서 think 자체의 정확도를 평가하는 것이 아니라, 모델이 **짧고 안정적인 중간 판단 형식**을 학습하도록 하는 보조 신호로 사용한다.
+
+---
+
+## Step 14. Early Fusion에서 Late Fusion으로 전환
+
+### Early Fusion 문제
+멀티뷰를 한 번에 모델 입력으로 넣는 early fusion을 시도했다.
+
+```text
+[clip_0 video] + [clip_1 video] + prompt -> one answer
+```
+
+하지만 zero-shot과 fine-tuning 모두에서 다음 문제가 있었다.
+
+- 입력이 길어지면 reasoning이 더 불안정해짐
+- view 간 정보가 섞이며 출력 형식이 깨짐
+- 2B 모델은 용량 부족으로 JSON schema 오류가 많음
+- 8B MV도 mode collapse가 반복됨
+
+### Late Fusion 설계
+각 view를 single-view 모델로 독립 추론한 뒤, action 단위에서 예측을 합친다.
+
+```text
+clip_0 -> pred_0
+clip_1 -> pred_1
+clip_2 -> pred_2
+fusion(pred_0, pred_1, pred_2) -> final action prediction
+```
+
+장점:
+- 학습은 single-view로 단순하게 유지
+- inference 때 여러 view를 모두 활용 가능
+- view별 성능과 오류를 따로 분석 가능
+- fusion rule을 offline으로 바꿔가며 비교 가능
+
+현재 구현된 fusion rule:
+
+| Rule | 의미 |
+|---|---|
+| `main_first` | clip_0 예측 우선, 없으면 다음 valid view |
+| `clip1_first` | clip_1 예측 우선, 없으면 clip_0 |
+| `majority_vote` | 전체 view 다수결, tie는 clip_0 |
+| `majority_clip1_tiebreak` | 전체 view 다수결, tie는 clip_1 우선 |
+| `conservative_card` | Red 단독 예측을 보수적으로 낮춤 |
+
+---
+
+## Step 15. View-expanded SV Training
+
+### 배경
+기존 SV 학습은 `clip_0`만 사용했다.
+Late fusion을 하려면 clip_1, clip_2 같은 replay view도 모델이 제대로 처리해야 한다.
+
+### 변경
+학습 sample 단위를 action이 아니라 **view**로 확장했다.
+
+```text
+action_0/clip_0.mp4 -> same offence_severity label
+action_0/clip_1.mp4 -> same offence_severity label
+action_0/clip_2.mp4 -> same offence_severity label
+```
+
+현재 clean run 설정:
+
+```text
+MODEL_ID       = nvidia/Cosmos-Reason2-8B
+OUTPUT_DIR     = outputs/qlora_cosmos8b_view_expanded_reason_clean
+NUM_EPOCHS     = 3
+NUM_FRAMES     = 32
+LR             = 5e-5
+LORA_R         = 128
+LORA_ALPHA     = 256
+GRAD_ACCUM     = 8
+MAX_TRAIN_VIEWS = 0  # all views
+MAX_EVAL_VIEWS  = 0  # all views
+FUSION_RULE    = main_first
+--balanced-sampling
+```
+
+학습 데이터 구성:
+
+```text
+view_samples = 5,277
+actions      = 2,319
+clip_0       = 2,319
+clip_1       = 2,319
+clip_2       =   538
+clip_3       =   101
+```
+
+이전 `outputs/qlora_cosmos8b_view_expanded_reason` run은 epoch 1 validation 후 JSON serialization 문제로 중단되었다.
+해당 문제는 `make_jsonable()` 저장 유틸로 해결했고, clean run은 별도 디렉토리에 다시 시작했다.
+
+---
+
+## Step 16. Resumable Zero-shot Late Fusion Evaluation
+
+### 문제
+전체 Valid zero-shot late fusion은 action마다 여러 view를 생성해야 해서 오래 걸린다.
+중간에 GPU를 끊으면 결과가 모두 사라지는 문제가 있었다.
+
+### 해결
+`eval_late_fusion_reason.py`에 다음 옵션을 추가했다.
+
+```text
+--save-every N   # N actions마다 rows/metrics/predictions 저장
+--resume         # 기존 rows.jsonl 또는 rows.json에서 완료 action을 읽고 건너뜀
+```
+
+저장 파일:
+
+```text
+outputs/zero_shot_late_fusion_reason_full_valid/
+  valid_base_views_rows.jsonl        # action 1개 완료마다 append
+  valid_base_views_rows.json         # save-every마다 갱신
+  valid_base_views_metrics.json      # save-every마다 갱신
+  valid_base_views_predictions.json  # save-every마다 갱신
+```
+
+현재 partial 결과는 zero-shot baseline 수집 중이다.
+90 samples 기준 중간 결과:
+
+```text
+accuracy_offence_severity = 18.89%
+balanced_accuracy_seen    = 14.89%
+view_parse_errors         = 18 / 207 views
+```
+
+관찰된 zero-shot 문제:
+
+- `<answer>` 태그를 거의 지키지 않음
+- CJK drift 발생
+- 출력이 1200자 이상 길어지는 경우 많음
+- `Offence + No card`를 거의 예측하지 못함
+- 접촉이 보이면 Yellow/Red로 과대 판정하는 경향
+
+이 결과는 fine-tuning 필요성을 보여주는 baseline으로 사용한다.
+
+---
+
+## Step 17. Outputs 정리와 Git Ignore
+
+`outputs/`가 너무 커져서 실험 보존용 archive로 정리했다.
+
+```text
+outputs/
+  archive_20260608/
+    training_checkpoints/
+    eval_results/
+    zero_shot/
+    diagnostics/
+    logs/
+  logs/
+  qlora_cosmos8b_view_expanded_reason_clean/
+  zero_shot_late_fusion_reason_full_valid/
+```
+
+`.gitignore`도 업데이트했다.
+
+주요 ignore 대상:
+
+```text
+data/
+outputs/
+*.safetensors
+*.pth
+*.pth.tar
+__pycache__/
+VARS model/models/
+VARS model/pretrained/
+```
+
+결과물과 가중치는 로컬에 보존하되, git에는 코드와 실험 문서만 올리는 구조로 정리했다.
+
+---
+
+## 현재 상태 (2026-06-08)
+
+| 항목 | 상태 |
+|---|---|
+| 태스크 | `offence_severity` 4분류 중심으로 전환 |
+| 출력 형식 | `<think>` slot reasoning + `<answer>{"offence_severity": ...}</answer>` |
+| 멀티뷰 전략 | early fusion 대신 view-expanded SV 학습 + late fusion |
+| zero-shot full Valid | GPU 0에서 진행 중, JSONL 중간 저장/resume 가능 |
+| view-expanded clean training | GPU 1에서 `outputs/qlora_cosmos8b_view_expanded_reason_clean`로 진행 중 |
+| 이전 깨진 run | `archive_20260608/training_checkpoints/qlora_cosmos8b_view_expanded_reason`에 보존 |
+| outputs 정리 | 완료 |
+| gitignore 정리 | 완료 |
+
+**현재 가장 중요한 다음 확인사항**:
+
+1. zero-shot late fusion full Valid 완료 후 fusion rule별 offline 평가
+2. view-expanded clean training 3 epoch 완료 여부 확인
+3. fine-tuned adapter로 Valid late fusion 재평가
+4. zero-shot 대비 parse error / CJK drift / balanced accuracy 개선 여부 확인
+5. best fusion rule을 선택해 Test 평가
+
+**현재 판단**:
+
+- zero-shot은 baseline으로 충분히 의미가 있지만, 출력 형식과 severity calibration이 불안정하다.
+- fine-tuning은 단순 accuracy뿐 아니라 JSON 형식 준수, CJK drift 감소, `Offence + No card` 회복 여부를 같이 평가해야 한다.
+- late fusion은 early fusion보다 분석과 ablation이 쉬워 현재 프로젝트 방향에 더 적합하다.
+

@@ -1,257 +1,343 @@
 # SoccerNet MVFoul — Experiment Log
 
-> 기준일: 2026-06-06  
-> 목표: SoccerNet MVFoul 데이터셋에서 파울 종류(action_class) 및 심각도(offence_severity) 분류
+> 기준일: 2026-06-08  
+> 목표: SoccerNet-MVFoul에서 VLM 기반 축구 파울 심각도(`offence_severity`) 분류
 
 ---
 
-## 1. 태스크 정의
+## 1. 현재 태스크 정의
 
-| 태스크 | 분류 대상 | 클래스 수 |
-|---|---|---|
-| Task 1 | action_class | 8 (Tackling, Standing tackling, High leg, Holding, Pushing, Elbowing, Challenge, Dive) |
-| Task 2 | offence_severity | 4 (No offence, Offence + No card, Offence + Yellow card, Offence + Red card) |
+초기에는 VARS와 동일하게 두 태스크를 동시에 다뤘다.
 
-**평가 지표**: Balanced Accuracy (seen classes)  
-**VARS 논문 베이스라인**: Task1 = **47.0%**, Task2 = **43.0%**, Avg = **45.0%**
+| 태스크 | 분류 대상 | 클래스 수 | 현재 사용 여부 |
+|---|---|---:|---|
+| Task 1 | `action_class` | 8 | 보류 |
+| Task 2 | `offence_severity` | 4 | **현재 메인** |
 
----
+현재 실험은 `offence_severity`만 예측한다.
 
-## 2. 데이터셋
-
-```
-data/SoccerNet/mvfouls/
-  Train/  Valid/  Test/
-    action_{id}/
-      annotations.json   ← 파울 속성 (Contact, Bodypart, Severity 등)
-      clip_0.mp4         ← 주 카메라 (항상 존재)
-      clip_1.mp4 ...     ← 추가 카메라 앵글
-```
-
-| Split | Actions | clip_0 samples (official_target 필터 후) |
-|---|---|---|
-| Train | 2,916 | ~6,621 |
-| Valid | 411 | 321 |
-| Test | 301 | 247 |
-
-**Annotation 필터 (`official_target`)**: action_class="Dont know", Offence="Between", Severity="2.0"/"4.0" 제외  
-**클래스 불균형**: Standing tackling ~45%, Dive ~1.2%
-
----
-
-## 3. 모델 구조
-
-### 베이스 모델
-- `nvidia/Cosmos-Reason2-8B` (Qwen3VLForConditionalGeneration)
-- Vision Encoder (SigLIP) + LLM (Qwen3 8B)
-
-### QLoRA 설정
-```
-4-bit NF4 quantization (bitsandbytes)
-Vision Encoder: 완전 동결
-LoRA 적용 대상: LLM attention + MLP 레이어
-  r=16 (SV) / r=32 (MV)
-  alpha=32 (SV) / alpha=64 (MV)
-  dropout=0.05
-실제 학습 파라미터: ~20M (전체의 ~0.25%)
-```
-
----
-
-## 4. 학습 방식 (Reasoning)
-
-### 핵심 아이디어: think + answer 동시 학습
-모델이 reasoning trace를 생성한 뒤 JSON 답을 내도록 학습.
-
-**학습 타겟 형식**:
-```
-<think>
-Analyzing the video clip:
-Contact: There is clear physical contact between the players.
-Body part: The challenge involves the lower body (legs/feet).
-Ball interaction: The player attempts to play the ball but does not make contact with it.
-A lower body challenge from a standing position... [action별 고정 reasoning]
-The card decision depends on the force of impact... [severity 기준]
-</think>
-<answer>{"action_class": "Standing tackling", "offence_severity": "Offence + Yellow card"}</answer>
-```
-
-**Reasoning trace 합성 (`synthesize_think`)**: 실제 사람이 쓴 reasoning 없음 → annotation 속성(Contact, Bodypart, Try to play, Touch ball)에서 deterministic하게 생성
-
-**Loss 마스킹**: assistant turn 전체(`<think>` + `<answer>`) 포함, user 프롬프트는 -100
-
-### 비디오 입력
-- **Foul-anchored sampling**: VARS 스펙상 t=3.0s(5초 클립의 60% 지점)에 파울 발생 → 해당 시점 밀집 샘플링
-- **Frame hint**: 프롬프트에 "Frame N of M이 충돌 순간" 명시
-  - SV 16프레임: Frame 10 of 16
-  - MV 32프레임: Frame 20 of 32
-
-### 균형 샘플링
-- `WeightedRandomSampler` + sqrt-inverse-frequency 가중치
-- Standing tackling 45% → ~27%로 완화
-
-### 반복 방지
-- `repetition_penalty=1.5` in `model.generate()`
-
----
-
-## 5. 실험 결과
-
-### 베이스라인
-
-| 모델 | 방식 | Valid Task1 | Valid Task2 | Avg |
-|---|---|---|---|---|
-| VARS 논문 | — | **47.0%** | **43.0%** | **45.0%** |
-| Cosmos-8B zero-shot (JSON) | 직접 분류 | 11.8% | 25.0% | 18.4% |
-| Cosmos-8B zero-shot (think+answer) | Reasoning 프롬프트 | 11.1% | 19.5% | 15.3% |
-
-### 완료된 Fine-tuning 실험
-
-| 실험 | 모델 | 설정 | Valid Task1 | Valid Task2 | Avg | 비고 |
-|---|---|---|---|---|---|---|
-| SV Reason v1 | 8B | LR=2e-4, 3ep, 16frames | **21.5%** | **25.2%** | **23.3%** | 현재 최고 |
-| SV Reason v1 (Test) | 8B | — | 17.9% | 25.2% | 21.6% | |
-| SV Reason Answer | 8B | answer-only masking | 5.8% | 15.1% | 10.4% | 폐기 |
-| 2B MV Reason | 2B | r=32, 32frames, 2views | 4.8% | 1.9% | 3.4% | 실패 |
-| 8B MV Reason v1 | 8B | LR=2e-4, 3ep, balanced 없음 | 10.6% | 9.3% | 10.0% | mode collapse |
-| 8B MV Reason v1 (Test) | 8B | — | 8.8% | 9.6% | 9.2% | |
-
-### 현재 실행 중 (2026-06-06 야간)
-
-| 실험 | GPU | 진행 상황 | ETA |
-|---|---|---|---|
-| **SV Reason v2** | GPU 0 | step 390/11595 (3.3%) | ~7시간 |
-| **MV Reason v2** | GPU 1 | step 160/11595 (1.4%) | ~17시간 |
-
-**v2 개선사항**:
-- Balanced sampling 추가 (sqrt-inverse-frequency)
-- LR: 2e-4 → **1e-4** (epoch 2→3 불안정 방지)
-- Epochs: 3 → **5** (안정 수렴)
-- Frame hint 프롬프트 추가 (충돌 시점 프레임 번호 명시)
-- repetition_penalty=1.5
-
----
-
-## 6. 실패 원인 분석
-
-### SV Reason Answer (answer-only masking) — 폐기
-- `<think>` 블록을 loss에서 제외 → 모델이 think 종료 방법을 학습 못 함
-- 추론 시 think 블록이 무한 반복 → `<answer>` 태그 도달 실패 (38.9%)
-- 해결: think+answer 전체 loss 포함으로 전환
-
-### 2B MV Reason — 실패
-- 2B 모델 용량 부족: 멀티뷰 reasoning + JSON 동시 처리 불가
-- CJK drift (중국어 생성), think 블록 붕괴 (78.8% 동일 boilerplate)
-- JSON 스키마 오류 95.3%
-
-### 8B MV Reason v1 — Mode Collapse
-- balanced sampling 없음 → 95% 예측이 "Standing tackling"
-- LR=2e-4에서 epoch 2→3 정확도 하락 (불안정)
-- 해결: balanced sampling + LR 절반 + epochs 연장
-
----
-
-## 7. 학습 설정 파일
-
-| 스크립트 | 역할 |
+| Label | 의미 |
 |---|---|
-| `scripts/sh/run_reason.sh` | SV Reason v2 train + eval |
-| `scripts/sh/run_multiview_reason_8b.sh` | MV Reason v2 train + eval |
-| `scripts/train/train_reason.py` | SV QLoRA 학습 |
-| `scripts/train/train_multiview_reason.py` | MV QLoRA 학습 |
-| `scripts/eval/eval_finetuned_reason.py` | SV 평가 (JSONL 스트리밍) |
-| `scripts/eval/eval_finetuned_multiview_reason.py` | MV 평가 |
-| `scripts/train/frame_utils.py` | Foul-anchored 프레임 추출, foul_frame_index() |
+| `No offence` | 파울 아님 |
+| `Offence + No card` | 파울이지만 카드 없음 |
+| `Offence + Yellow card` | 옐로 카드 수준 |
+| `Offence + Red card` | 레드 카드 수준 |
 
-### SV Reason v2 하이퍼파라미터
-```
-MODEL_ID  = nvidia/Cosmos-Reason2-8B
-NUM_FRAMES = 16
-NUM_EPOCHS = 5
-LR         = 1e-4
-LORA_R     = 16, LORA_ALPHA = 32
-GRAD_ACCUM = 8
-MAX_NEW_TOKENS = 512
-MAX_CLASS_WEIGHT = 3.0
---balanced-sampling
+**평가 지표**: accuracy + balanced accuracy (seen classes)  
+**비교 기준**: VARS 논문 Task2 balanced accuracy 약 **43.0%**
+
+---
+
+## 2. 데이터셋 요약
+
+```text
+data/SoccerNet/mvfouls/
+  Train/
+  Valid/
+  Test/
+    action_{id}/
+      clip_0.mp4       # main camera
+      clip_1.mp4 ...   # replay / alternate views
+    annotations.json
 ```
 
-### MV Reason v2 하이퍼파라미터
+공식 annotation에서 다음 케이스는 제외한다.
+
+```text
+action_class == "Dont know"
+Offence == "Between"
+Severity in {"2.0", "4.0"}
 ```
-MODEL_ID   = nvidia/Cosmos-Reason2-8B
-NUM_FRAMES = 32 (per view, 2 views)
-MAX_PIXELS = 10,000,000
-NUM_EPOCHS = 5
-LR         = 1e-4
-LORA_R     = 32, LORA_ALPHA = 64
-GRAD_ACCUM = 8
-MAX_NEW_TOKENS = 1024
-MAX_CLASS_WEIGHT = 3.0
---balanced-sampling
-VRAM: ~23.2GB reserved
+
+| Split | 원본 Actions | official target actions |
+|---|---:|---:|
+| Train | 2,916 | 2,319 actions / 5,277 view samples (view-expanded 기준) |
+| Valid | 411 | 321 actions |
+| Test | 301 | 247 actions |
+
+View-expanded train 분포:
+
+| View | Count |
+|---|---:|
+| clip_0 | 2,319 |
+| clip_1 | 2,319 |
+| clip_2 | 538 |
+| clip_3 | 101 |
+
+Severity view-counts:
+
+| Label | Train view count |
+|---|---:|
+| `Offence + No card` | 2,925 |
+| `Offence + Yellow card` | 1,598 |
+| `No offence` | 678 |
+| `Offence + Red card` | 76 |
+
+---
+
+## 3. 모델과 학습 방식
+
+### Base Model
+
+```text
+nvidia/Cosmos-Reason2-8B
+Qwen3VLForConditionalGeneration 기반 VLM
+```
+
+### QLoRA
+
+```text
+4-bit NF4 quantization
+Vision encoder freeze
+LoRA target: LLM attention + MLP modules
+Optimizer: PagedAdamW8bit
+Gradient accumulation: 8
+```
+
+현재 view-expanded clean run:
+
+```text
+OUTPUT_DIR      = outputs/qlora_cosmos8b_view_expanded_reason_clean
+MODEL_ID        = nvidia/Cosmos-Reason2-8B
+NUM_EPOCHS      = 3
+NUM_FRAMES      = 32
+LR              = 5e-5
+LORA_R          = 128
+LORA_ALPHA      = 256
+MAX_TRAIN_VIEWS = 0  # all views
+MAX_EVAL_VIEWS  = 0  # all views
+FUSION_RULE     = main_first
+```
+
+현재 실행 중인 프로세스:
+
+```text
+GPU 1: train_view_expanded_reason.py
 ```
 
 ---
 
-## 8. Skeleton 데이터 탐색
+## 4. Reasoning Prompt
 
-### 데이터 구조
-```
-data/SoccerNet/PDF1_skeleton_share/X-VARS/outputs/skeleton_yolo11/
-  {train|valid|test}/action_{id}/clip_{idx}.npz
-  pose_qc_{split}.csv   ← QC 상태 (ok / too_few_people / failed)
-```
+현재 출력은 severity-only다.
 
-```
-NPZ 구조:
-  keypoints      (12, 10, 17, 3)  — 픽셀 좌표 + confidence
-  keypoints_norm (12, 10, 17, 3)  — 정규화
-  bboxes         (12, 10, 4)
-  person_scores  (12, 10)         — YOLO 검출 신뢰도
-  frame_indices  (12,)
-  video_width, video_height, fps
+```text
+<think>
+contact: yes/no/unclear
+ball_play: yes/no/unclear
+force: low/medium/high/unclear
+risk: low/medium/high/unclear
+offence: yes/no
+card_threshold: no_card/yellow/red/none
+decision: one short reason
+</think>
+<answer>{"offence_severity": "Offence + Yellow card"}</answer>
 ```
 
-### QC 필터 후 매칭 수 (status='ok')
-
-| Split | 전체 | ok | too_few_people | failed |
-|---|---|---|---|---|
-| Train | 6,621 | 4,933 | 1,400 | 288 |
-| Valid | 970 | 741 | 197 | 32 |
-| Test | 706 | 527 | 145 | 34 |
-
-### 시도 및 결론
-
-| 접근 | 결과 | 결론 |
-|---|---|---|
-| 별도 skeleton 분류기 (MLP) | Valid action_acc=**8.4%** (랜덤=12.5%보다 낮음) | **폐기** |
-| Late fusion (VLM + skeleton) | base 분류기가 나쁘면 VLM을 오히려 망침 | **폐기** |
-| VLM 학습에 skeleton overlay | 파울 당사자 2명 식별 불가, 노이즈 리스크 큼 | **폐기** |
-| Eval 시 skeleton text hint | 재학습 불필요, A/B 테스트 가능 | **보류** (VLM 결과 확인 후 판단) |
-
-**핵심 문제**: 축구 경기 wide-angle에서 10명 검출 시 상위 2명 ≠ 파울 당사자. 관절 좌표만으로 foul 종류 구분은 인간도 어려운 과제.
+평가는 `<answer>` 안의 JSON 또는 parser가 복구한 `offence_severity`만 사용한다.
 
 ---
 
-## 9. 출력 디렉토리
+## 5. 멀티뷰 전략
 
+### 폐기한 방향: Early Fusion
+
+```text
+[clip_0 video] + [clip_1 video] + prompt -> one answer
 ```
+
+문제:
+
+- 긴 입력에서 reasoning 형식이 더 쉽게 붕괴
+- 2B 모델은 JSON schema 오류와 CJK drift가 큼
+- 8B MV도 mode collapse 발생
+- 어떤 view가 문제인지 분석하기 어려움
+
+### 현재 방향: View-expanded SV + Late Fusion
+
+학습은 view 단위로 한다.
+
+```text
+action_i/clip_0.mp4 -> same offence_severity
+action_i/clip_1.mp4 -> same offence_severity
+action_i/clip_2.mp4 -> same offence_severity
+```
+
+추론은 view별로 독립 실행 후 action 단위로 fusion한다.
+
+```text
+clip_0 -> pred_0
+clip_1 -> pred_1
+clip_2 -> pred_2
+fusion(pred_0, pred_1, pred_2) -> final prediction
+```
+
+Fusion rules:
+
+| Rule | 설명 |
+|---|---|
+| `main_first` | clip_0 우선 |
+| `clip1_first` | clip_1 우선 |
+| `majority_vote` | 전체 view 다수결, tie는 clip_0 |
+| `majority_clip1_tiebreak` | 전체 view 다수결, tie는 clip_1 |
+| `conservative_card` | 단독 Red 예측을 보수적으로 낮춤 |
+
+---
+
+## 6. 지금까지의 주요 결과
+
+### 과거 baseline / 실패 실험
+
+| 실험 | 모델 | 설정 | Valid Task1 | Valid Task2 | Avg | 판단 |
+|---|---|---|---:|---:|---:|---|
+| VARS 논문 | MViT | multi-view | 47.0 | 43.0 | 45.0 | 비교 기준 |
+| Cosmos-8B zero-shot JSON | 8B | single-view | 11.8 | 25.0 | 18.4 | 낮음 |
+| Cosmos-8B zero-shot think+answer | 8B | single-view | 11.1 | 19.5 | 15.3 | 낮음 |
+| SV Reason v1 | 8B | 16 frames, LR=2e-4 | 21.5 | 25.2 | 23.3 | 이전 최고 |
+| SV Reason Answer | 8B | answer-only masking | 5.8 | 15.1 | 10.4 | 폐기 |
+| 2B MV Reason | 2B | 2 views | 4.8 | 1.9 | 3.4 | 실패 |
+| 8B MV Reason v1 | 8B | early fusion | 10.6 | 9.3 | 10.0 | mode collapse |
+
+### 현재 zero-shot late fusion partial
+
+경로:
+
+```text
+outputs/zero_shot_late_fusion_reason_full_valid/
+```
+
+실행 상태:
+
+```text
+GPU 0: eval_late_fusion_reason.py
+```
+
+중간 저장 파일:
+
+```text
+valid_base_views_rows.jsonl        # action 1개마다 append
+valid_base_views_rows.json         # --save-every마다 갱신
+valid_base_views_metrics.json      # --save-every마다 갱신
+valid_base_views_predictions.json  # --save-every마다 갱신
+```
+
+90 samples 기준 partial metrics:
+
+| Metric | Value |
+|---|---:|
+| Accuracy | 18.89 |
+| Balanced accuracy | 14.89 |
+| View parse errors | 18 / 207 views |
+
+Support:
+
+| Label | Count |
+|---|---:|
+| `No offence` | 11 |
+| `Offence + No card` | 50 |
+| `Offence + Yellow card` | 27 |
+| `Offence + Red card` | 2 |
+
+관찰:
+
+- zero-shot은 `<answer>` 태그를 잘 지키지 못함
+- CJK drift 발생
+- 출력이 지나치게 길어지는 경우 많음
+- `Offence + No card`를 거의 예측하지 못함
+- Yellow/Red 과대예측 경향
+
+이 결과는 fine-tuning 필요성을 보여주는 baseline으로 사용한다.
+
+---
+
+## 7. 현재 실행 중인 실험
+
+| 실험 | GPU | 상태 | 출력 |
+|---|---:|---|---|
+| View-expanded SV QLoRA clean train | 1 | 실행 중 | `outputs/qlora_cosmos8b_view_expanded_reason_clean` |
+| Zero-shot late fusion full Valid | 0 | 실행 중 | `outputs/zero_shot_late_fusion_reason_full_valid` |
+
+이전 깨진 view-expanded run:
+
+```text
+outputs/archive_20260608/training_checkpoints/qlora_cosmos8b_view_expanded_reason
+```
+
+원인:
+
+```text
+TypeError: Object of type set is not JSON serializable
+```
+
+해결:
+
+- `make_jsonable()` 추가
+- train/eval/offline fusion 저장부에 적용
+- 새 clean run은 별도 output dir에서 재시작
+
+---
+
+## 8. 코드와 스크립트
+
+| 파일 | 역할 |
+|---|---|
+| `scripts/train/train_reason.py` | single-view reasoning QLoRA |
+| `scripts/train/train_multiview_reason.py` | early-fusion multiview reasoning QLoRA |
+| `scripts/train/train_view_expanded_reason.py` | **view-expanded SV 학습** |
+| `scripts/eval/eval_late_fusion_reason.py` | **view별 inference + action-level fusion** |
+| `scripts/eval/refuse_late_fusion_rows.py` | 저장된 rows로 offline fusion 재평가 |
+| `scripts/train/frame_utils.py` | foul-anchored frame sampling |
+| `scripts/sh/run_view_expanded_reason.sh` | view-expanded 실험 wrapper |
+
+`eval_late_fusion_reason.py`의 최신 기능:
+
+```text
+--save-every N   # N actions마다 partial rows/metrics/predictions 저장
+--resume         # 기존 rows.jsonl/json에서 이어서 실행
+```
+
+---
+
+## 9. Outputs 정리
+
+현재 최상위 구조:
+
+```text
 outputs/
-  qlora_cosmos8b_reason_2/        ← SV Reason v2 체크포인트 (학습 중)
-  qlora_cosmos8b_multiview_reason/ ← MV Reason v2 체크포인트 (학습 중)
-  reason_eval_2/                  ← SV v2 eval 결과
-  multiview_reason_8b_eval/       ← MV eval 결과
-  skeleton_model/                 ← skeleton MLP (사용 안 함)
-  zero_shot_8b/                   ← zero-shot 베이스라인
+  archive_20260608/
+    diagnostics/
+    eval_results/
+    logs/
+    training_checkpoints/
+    zero_shot/
   logs/
-    sv_reason/   mv_reason/   skeleton/
+  qlora_cosmos8b_view_expanded_reason_clean/
+  zero_shot_late_fusion_reason_full_valid/
 ```
+
+보존 정책:
+
+- 과거 실험 결과는 `archive_20260608/` 아래로 이동
+- 현재 진행 중인 clean train과 zero-shot full valid만 최상위 유지
+- `.gitignore`에서 `data/`, `outputs/`, checkpoint, cache 제외
 
 ---
 
-## 10. 다음 단계 (v2 결과 확인 후)
+## 10. 다음 할 일
 
-1. **SV Reason v2** 결과가 v1 대비 얼마나 개선됐는지 확인 (balanced sampling 효과)
-2. **MV Reason v2** 결과 확인 (mode collapse 해소 여부)
-3. MV가 SV보다 좋다면 → 두 뷰 정보를 활용한 추가 실험 설계
-4. skeleton text hint를 eval에 추가해서 비교 (선택적)
+1. zero-shot late fusion full Valid 완료 확인
+2. offline fusion rules 비교
+   - `main_first`
+   - `clip1_first`
+   - `majority_vote`
+   - `majority_clip1_tiebreak`
+   - `conservative_card`
+3. view-expanded clean train 3 epoch 완료 확인
+4. fine-tuned adapter로 Valid late fusion 평가
+5. fine-tuned 결과에서 다음 항목 비교
+   - balanced accuracy
+   - parse error 감소 여부
+   - CJK drift 감소 여부
+   - `Offence + No card` 회복 여부
+6. best fusion rule로 Test 평가
+7. 보고서에는 zero-shot instability와 fine-tuning 개선을 함께 제시
