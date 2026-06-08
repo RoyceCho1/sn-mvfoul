@@ -142,45 +142,18 @@ def clips2vectormerge(folder_path, split, num_views, not_taking):
 			if str(i) in not_taking:
 				continue
 			
+			path_clip = os.path.join(path_clips, "action_" + str(i))
+			available_clips = []
+			for clip_idx in range(4):
+				path_clip_view = os.path.join(path_clip, "clip_" + str(clip_idx) + ".mp4")
+				if os.path.exists(path_clip_view):
+					available_clips.append(path_clip_view)
+
 			if num_views == 1:
-				path_clip = os.path.join(path_clips, "action_" + str(i))
-				path_clip_0 = os.path.join(path_clip, "clip_0.mp4")
-				clips_all_view = []
-				clips_all_view.append(path_clip_0)
-				clips.append(clips_all_view)
-				clips_all_view = []
-				path_clip_1 = os.path.join(path_clip, "clip_1.mp4")
-				clips_all_view.append(path_clip_1)
-				clips.append(clips_all_view)
-				clips_all_view = []
-
-				if os.path.exists(os.path.join(path_clip, "clip_2.mp4")):
-					path_clip_2 = os.path.join(path_clip, "clip_2.mp4")
-					clips_all_view.append(path_clip_2)
-					clips.append(clips_all_view)
-					clips_all_view = []
-
-				if os.path.exists(os.path.join(path_clip, "clip_3.mp4")):
-					path_clip_3 = os.path.join(path_clip, "clip_3.mp4")
-					clips_all_view.append(path_clip_3)
-					clips.append(clips_all_view)
-					clips_all_view = []
+				for path_clip_view in available_clips:
+					clips.append([path_clip_view])
 			else:
-				path_clip = os.path.join(path_clips, "action_" + str(i))
-				path_clip_0 = os.path.join(path_clip, "clip_0.mp4")
-				clips_all_view = []
-				clips_all_view.append(path_clip_0)
-				path_clip_1 = os.path.join(path_clip, "clip_1.mp4")
-				clips_all_view.append(path_clip_1)
-
-				if os.path.exists(os.path.join(path_clip, "clip_2.mp4")):
-					path_clip_2 = os.path.join(path_clip, "clip_2.mp4")
-					clips_all_view.append(path_clip_2)
-
-				if os.path.exists(os.path.join(path_clip, "clip_3.mp4")):
-					path_clip_3 = os.path.join(path_clip, "clip_3.mp4")
-					clips_all_view.append(path_clip_3)
-				clips.append(clips_all_view)
+				clips.append(available_clips)
 
 		return clips
 

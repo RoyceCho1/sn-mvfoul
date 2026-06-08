@@ -66,6 +66,7 @@ class MultiViewDataset(Dataset):
     def __getitem__(self, index):
 
         prev_views = []
+        videos = None
 
         for num_view in range(len(self.clips[index])):
 
@@ -89,6 +90,9 @@ class MultiViewDataset(Dataset):
             video, _, _ = read_video(self.clips[index][index_view], output_format="THWC")
             frames = video[self.start:self.end,:,:,:]
 
+            if len(frames) == 0:
+                continue
+
             final_frames = None
 
             for j in range(len(frames)):
@@ -98,6 +102,9 @@ class MultiViewDataset(Dataset):
                     else:
                         final_frames = torch.cat((final_frames, frames[j,:,:,:].unsqueeze(0)), 0)
 
+            if final_frames == None:
+                continue
+
             final_frames = final_frames.permute(0, 3, 1, 2)
 
             if self.transform != None:
@@ -106,11 +113,14 @@ class MultiViewDataset(Dataset):
             final_frames = self.transform_model(final_frames)
             final_frames = final_frames.permute(1, 0, 2, 3)
             
-            if num_view == 0:
-                videos = final_frames.unsqueeze(0)
+            final_frames = final_frames.unsqueeze(0)
+            if videos is None:
+                videos = final_frames
             else:
-                final_frames = final_frames.unsqueeze(0)
                 videos = torch.cat((videos, final_frames), 0)
+
+        if videos is None:
+            raise RuntimeError(f"No valid clips found for action index {index}: {self.clips[index]}")
 
         if self.num_views != 1 and self.num_views != 5:
             videos = videos.squeeze()   
